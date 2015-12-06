@@ -7,19 +7,51 @@ var bunyan = require('bunyan'),
 
 var log = bunyan.createLogger({ name: 'pioneers-client', level: 'debug' });
 
-var Client = function(id) {
+var Client = function (ws, id) {
 	if (!(this instanceof Client)) { return new Client(id); }
 	if (id === undefined) {
 		id = uuid.v4();
 	}
 
 	this.id = id;
+	this._ws = ws;
 	EventEmitter.call(this);
 };
 util.inherits(Client, EventEmitter);
+Client.prototype.join = function (room) {
+	var self = this;
 
-exports.initialize = function() {
-	return new Promise(function(resolve, reject) {
-		resolve(new Client());
+	return new Promise(function (resolve, reject) {
+		self.room = room;
+
+		resolve(self);
+	});
+};
+Client.prototype.send = function (data) {
+	var self = this;
+
+	return new Promise(function (resolve, reject) {
+		return self._ws.send(data);
+	});
+};
+
+exports.initialize = function (ws) {
+	return new Promise(function (resolve, reject) {
+		resolve(new Client(ws));
+	}).then(function (client) {
+		client._ws.on('error', function (err) {
+			client.emit('error', err);
+			client._ws.close();
+		});
+
+		client._ws.on('close', function () {
+			client.emit('close');
+		});
+		
+		client._ws.on('message', function (msg) {
+			client.emit('message', msg);
+		});
+
+		return client;
 	});
 };
