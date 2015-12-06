@@ -3,87 +3,19 @@ var http = require('http'),
 	path = require('path'),
 	util = require('util');
 
-var amqp = require('amqp'),
-	bunyan = require('bunyan'),
+var bunyan = require('bunyan'),
 	bodyParser = require('body-parser'),
 	express = require('express'),
 	promise = require('es6-promise').Promise,
 	uuid = require('node-uuid'),
 	wss = require('ws').Server;
 
+var amqpPromise = require('./lib/amqpPromise');
+
 var HOST = '0.0.0.0';
 var PORT = 3000;
-var log = bunyan.createLogger({ name: 'pioneers', level: 'debug' });
-
-var setupWebServer = function(app) {
-	return new Promise(function(resolve, reject) {
-		log.info('Setting up web server listening on %s:%d ...', HOST, PORT);
-		var server = app.listen(PORT, HOST, function(err) {
-			if (err) { reject(err); }
-
-			resolve(server);
-		});
-	});
-};
-var setupWebSocketServer = function(server) {
-	return new Promise(function(resolve, reject) {
-		log.info('Setting up WebSocket server ...');
-		var wsServer = new wss({ server: server });
-
-		resolve(wsServer);
-	});
-};
-var setupMQ = function() {
-	return new Promise(function(resolve, reject) {
-		log.info('Setting up rabbitMQ client ...');
-		var connection = amqp.createConnection({ 
-			host: 'localhost', 
-			clientProperties: {
-				applicationName: 'pioneers',
-				capabilities: {}
-			}
-		});
-
-		connection.on('ready', function() {
-			resolve(connection);
-		});
-	});
-};
-var setupMQBinds = function(mq) {
-	// Two exchanges that always have to exist
-	log.info('Setting up static rabbitMQ exchanges ...');
-	var exchanges = ['server-to-user', 'user-to-server'];
-	return Promise.all(exchanges.map(function(exchangeName) {
-		log.debug('Creating exchange %s ...', exchangeName);
-		return new Promise(function(resolve, reject) {
-			mq.exchange(exchangeName, { type: 'topic', autoDelete: false }, function(exchange) {
-				resolve(exchange);
-			}).on('error', function(err) { reject(err); });
-		});
-	}));
-};
-var setupMonitor = function(res) {
-	var mq = res[0],
-		exchanges = res[1];
-
-	log.info('Setting up monitor ...');
-	var monitorID = uuid.v4(),
-		routingKey = '#',
-		exchangeName = exchanges[1].name;
-
-	return new Promise(function(resolve, reject) {
-		mq.queue(util.format('monitor.%s', monitorID), { exclusive: true, autoDelete: true }, function(queue) {
-			log.debug('Creating binding with routingKey %s between queue %s and exchange %s', routingKey, queue.name, exchangeName);
-			queue.bind(exchangeName, routingKey);
-
-			queue.on('queueBindOk', function() {
-				resolve(queue);
-			});
-		}).on('error', function(err) { reject(err); });
-	});
-};
-
 var app = express();
+var log = bunyan.createLogger({ name: 'pioneers', level: 'debug' });
 
 log.info('Setting up Express middleware ...');
 app.set('views', __dirname + '/views');
@@ -97,14 +29,60 @@ app.get('/', function(req, res) {
 	});
 });
 
-var p_app = Promise.resolve(app),
-	p_server = p_app.then(setupWebServer),
-	p_wsServer = p_server.then(setupWebSocketServer),
-	p_mq = Promise.resolve().then(setupMQ),
-	p_mqExchanges = p_mq.then(setupMQBinds),
-	p_monitor = Promise.all([p_mq, p_mqExchanges]).then(setupMonitor);
+var setupApp = Promise.resolve(app),
+	setupServer = setupApp.then(function(app) {
+		return new Promise(function(resolve, reject) {
+			log.info('Setting up web server listening on %s:%d ...', HOST, PORT);
+			var server = app.listen(PORT, HOST, function(err) {
+				if (err) { reject(err); }
 
-Promise.all([p_app, p_server, p_wsServer, p_mq, p_mqExchanges, p_monitor]).then(function(res) {
+				resolve(server);
+			});
+		});
+	}),
+	setupWSServer = setupServer.then(function(server) {
+		return new Promise(function(resolve, reject) {
+			log.info('Setting up WebSocket server ...');
+			var wsServer = new wss({ server: server });
+
+			resolve(wsServer);
+		});
+	}),
+	setupMQ = Promise.resolve().then(function() {
+		log.info('Setting up rabbitMQ client ...');
+		return amqpPromise.connect({
+			host: 'localhost', 
+			clientProperties: {
+				applicationName: 'pioneers',
+				capabilities: {}
+			}
+		});
+	}),
+	setupExchanges = setupMQ.then(function(mq) {
+		// Two exchanges that always have to exist
+		log.info('Setting up static rabbitMQ exchanges ...');
+		var exchanges = ['server-to-user', 'user-to-server'];
+		return Promise.all(exchanges.map(function(exchangeName) {
+			log.debug('Creating exchange %s ...', exchangeName);
+			return mq.exchange(exchangeName, { type: 'topic', autoDelete: false });
+		}));
+	}),
+	setupMonitor = Promise.all([setupMQ, setupExchanges]).then(function(res) {
+		var mq = res[0],
+			exchanges = res[1];
+
+		log.info('Setting up monitor ...');
+		var monitorID = uuid.v4(),
+			routingKey = '#',
+			exchangeName = exchanges[1]._exchange.name;
+
+		log.info(monitorID, routingKey, exchangeName);
+		return mq.queue(util.format('monitor.%s', monitorID), { exclusive: true, autoDelete: true }).then(function(queue) {
+			return queue.bind(exchangeName, routingKey);
+		});
+	});
+
+Promise.all([setupApp, setupServer, setupWSServer, setupMQ, setupExchanges, setupMonitor]).then(function(res) {
 	var app = res[0],
 		server = res[1],
 		wsServer = res[2],
@@ -121,7 +99,7 @@ Promise.all([p_app, p_server, p_wsServer, p_mq, p_mqExchanges, p_monitor]).then(
 
 	wsServer.on('connection', function(ws) {
 		var room = ws.upgradeReq.url.substring(1),
-			exchangeName = serverToUser.name,
+			exchangeName = serverToUser._exchange.name,
 			clientID = uuid.v4();
 
 		log.info('Client %s has connected', clientID);
@@ -132,23 +110,16 @@ Promise.all([p_app, p_server, p_wsServer, p_mq, p_mqExchanges, p_monitor]).then(
 			{ queue: util.format('client.%s.private', clientID), routingKey: util.format('room.%s.client.%s.#', room, clientID) }
 		];
 
-		Promise.all(properties.map(function(prop) {
+		log.info('Creating client queues ...');
+		var queues = Promise.all(properties.map(function(prop) {
 			log.debug('Creating queue %s for client %s ...', prop.queue, clientID);
-			return new Promise(function(resolve, reject) {
-				mq.queue(prop.queue, { exclusive: true, autoDelete: true }, function(queue) {
-					log.debug('Creating binding with routingKey %s between queue %s and exchange %s', 
-						prop.routingKey, queue.name, exchangeName);
-					queue.bind(exchangeName, prop.routingKey);
-
-					queue.on('queueBindOk', function() {
-						resolve(queue);
-					});
-				}).on('error', function(err) { reject(err); });
-			});
-		})).then(function(queues) {
-			log.info('Set up queue forwarding over websocket ...');
-			queues.forEach(function(queue) {
-				queue.subscribe(function(message, headers, deliveryInfo, messageObj) {
+			return mq.queue(prop.queue, { exclusive: true, autoDelete: true }).then(function(queue) {
+				log.debug('Creating binding with routingKey %s between queue %s and exchange %s', 
+					prop.routingKey, prop.queue, exchangeName);
+				return queue.bind(exchangeName, prop.routingKey);
+			}).then(function(queue) {
+				log.debug('Set up queue forwarding over websocket ...');
+				return queue.subscribe(function(message, headers, deliveryInfo, messageObj) {
 					if (message.data instanceof Buffer) {
 						message = message.data.toString('utf8');
 					}
@@ -157,28 +128,32 @@ Promise.all([p_app, p_server, p_wsServer, p_mq, p_mqExchanges, p_monitor]).then(
 					});
 				});
 			});
-
+		})).then(function(queues) {
 			log.info('Binding events to client websocket ...');
 			ws.on('message', function(data, flags) {
 				var payload = JSON.parse(data);
 
 				log.debug('Client %s has sent data', clientID, data, flags);
-				userToServer.publish(util.format('client.%s.%s', clientID, payload.action), payload.data); 
+				userToServer.publish(util.format('client.%s.%s', clientID, payload.action), payload.data).then(function(exchange) {
+					log.debug('Passed client %s data onto monitor\'s exchange', clientID);	
+				}); 
 			});
 
 			ws.on('error', function(err) {
 				log.error('Client %s has encountered an error', clientID, err, err.stack);
-				queues.forEach(function(queue) {
-					queue.destroy();
+				Promise.all(queues.map(function(queue) {
+					return queue.destroy();
+				})).then(function() {
+					ws.close();
 				});
-				ws.close();
 			});
 
 			ws.on('close', function() {
-				queues.forEach(function(queue) {
-					queue.destroy();
+				Promise.all(queues.map(function(queue) {
+					return queue.destroy();
+				})).then(function() {
+					log.info('Client %s has disconnected', clientID);
 				});
-				log.info('Client %s has disconnected', clientID);
 			});
 		}).then(function() {
 			log.info('Finished client %s set up', clientID);	
