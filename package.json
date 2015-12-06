@@ -1,0 +1,22 @@
+{
+  "name": "pioneers",
+  "version": "0.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js | bunyan",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "BSD-2-Clause",
+  "dependencies": {
+    "bunyan": "~1.5.1",
+    "amqp": "~0.2.4",
+    "express": "~4.13.3",
+    "es6-promise": "~3.0.2",
+    "body-parser": "~1.14.1",
+    "jade": "~1.11.0",
+    "ws": "~0.8.1",
+    "node-uuid": "~1.4.7"
+  }
+}
